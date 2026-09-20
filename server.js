@@ -34,6 +34,17 @@ const supabaseAdmin = createClient(
   }
 );
 
+const supabaseAuth = createClient(
+  SUPABASE_URL,
+  SUPABASE_ADMIN_KEY,
+  {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  }
+);
+
 const MEDIA_BUCKET = process.env.SUPABASE_MEDIA_BUCKET || 'pyq-pulse-media';
 let mediaBucketReady = null;
 
@@ -521,8 +532,8 @@ async function auth(req, res, next) {
       return error(res, 401, 'Invalid or expired token.', 'auth_invalid');
     }
 
-    const { data, error: authError } =
-      await supabaseAdmin.auth.getUser(token);
+   const { data, error: authError } =
+  await supabaseAuth.auth.getUser(token);
 
     if (authError || !data?.user) {
       return error(res, 401, 'Invalid or expired token.', 'auth_invalid');
