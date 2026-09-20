@@ -45,6 +45,17 @@ const supabaseAuth = createClient(
   }
 );
 
+const supabaseStorage = createClient(
+  SUPABASE_URL,
+  SUPABASE_ADMIN_KEY,
+  {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  }
+);
+
 const MEDIA_BUCKET = process.env.SUPABASE_MEDIA_BUCKET || 'pyq-pulse-media';
 let mediaBucketReady = null;
 
@@ -148,7 +159,8 @@ function isAdminEmail(email) {
 async function ensureMediaBucket() {
   if (!mediaBucketReady) {
     mediaBucketReady = (async () => {
-      const { data: buckets, error: listError } = await supabaseAdmin.storage.listBuckets();
+const { data: buckets, error: listError } =
+  await supabaseStorage.storage.listBuckets();
       if (listError) throw listError;
       const existing = (buckets || []).find((b) => b.name === MEDIA_BUCKET);
       if (existing) {
@@ -159,7 +171,8 @@ async function ensureMediaBucket() {
         }
         return;
       }
-      const { error: createError } = await supabaseAdmin.storage.createBucket(MEDIA_BUCKET, {
+const { error: createError } =
+  await supabaseStorage.storage.createBucket(MEDIA_BUCKET, {
         public: true,
         fileSizeLimit: '10MB',
       });
@@ -464,10 +477,10 @@ console.log('[MEDIA DEBUG]', {
   fileSize: file.data?.length,
 });
 
-    const {
-      error: uploadError,
-    } = await supabaseAdmin.storage
-      .from(MEDIA_BUCKET)
+   const {
+  error: uploadError,
+} = await supabaseStorage.storage
+  .from(MEDIA_BUCKET)
       .upload(
         objectPath,
         file.data,
@@ -485,9 +498,9 @@ console.log('[MEDIA DEBUG]', {
     const {
       data: publicUrlData,
     } =
-      supabaseAdmin.storage
-        .from(MEDIA_BUCKET)
-        .getPublicUrl(objectPath);
+   supabaseStorage.storage
+  .from(MEDIA_BUCKET)
+  .getPublicUrl(objectPath);
 
     return response(
       res,
