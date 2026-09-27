@@ -2165,6 +2165,267 @@ function mapSet(row) {
   };
 }
 
+
+// Load mappings for a batch of question ids (uuid[])
+async function loadQuestionMappings(questionIds) {
+  const empty = { exams: {}, subjects: {}, topics: {}, sets: {} };
+  if (!questionIds || !questionIds.length) return empty;
+
+  const [qe, qs, qt] = await Promise.all([
+    supabaseAdmin
+      .from("question_exams")
+      .select("question_id, exam_id, exams(id,name,code)")
+      .in("question_id", questionIds),
+    supabaseAdmin
+      .from("question_subjects")
+      .select("question_id, subject_id, subjects(id,name)")
+      .in("question_id", questionIds),
+    supabaseAdmin
+      .from("question_topics")
+      .select("question_id, topic_id, taxonomy_nodes(id,name)")
+      .in("question_id", questionIds),
+  ]);
+
+  if (qe.error) throw qe.error;
+  if (qs.error) throw qs.error;
+  if (qt.error) throw qt.error;
+
+  const exams = {}, subjects = {}, topics = {};
+
+  // Deduplicate both IDs and display names. The admin UI must show exactly
+  // one value for every selected mapping — never the same mapping twice.
+  for (const r of qe.data || []) {
+    const bucket = (exams[r.question_id] ||= { ids: [], names: [] });
+    if (r.exam_id && !bucket.ids.includes(String(r.exam_id))) {
+      bucket.ids.push(String(r.exam_id));
+    }
+    if (r.exams?.name && !bucket.names.includes(String(r.exams.name))) {
+      bucket.names.push(String(r.exams.name));
+    }
+  }
+  for (const r of qs.data || []) {
+    const bucket = (subjects[r.question_id] ||= { ids: [], names: [] });
+    if (r.subject_id && !bucket.ids.includes(String(r.subject_id))) {
+      bucket.ids.push(String(r.subject_id));
+    }
+    if (r.subjects?.name && !bucket.names.includes(String(r.subjects.name))) {
+      bucket.names.push(String(r.subjects.name));
+    }
+  }
+  for (const r of qt.data || []) {
+    const bucket = (topics[r.question_id] ||= { ids: [], names: [] });
+    if (r.topic_id && !bucket.ids.includes(String(r.topic_id))) {
+      bucket.ids.push(String(r.topic_id));
+    }
+    if (r.taxonomy_nodes?.name && !bucket.names.includes(String(r.taxonomy_nodes.name))) {
+      bucket.names.push(String(r.taxonomy_nodes.name));
+    }
+  }
+
+  return { exams, subjects, topics };
+}
+
+
+async function loadQuestionSets(questionIds) {
+  const sets = {};
+  if (!questionIds || !questionIds.length) return sets;
+
+  const { data, error } = await supabaseAdmin
+    .from('set_questions')
+    .select('question_id,set_id,position,sets(id,name,exam_id,subject_id,year,set_type,is_published)')
+    .in('question_id', questionIds)
+    .order('position', { ascending: true });
+
+  if (error) throw error;
+
+  for (const row of data || []) {
+    const bucket = (sets[row.question_id] ||= { ids: [], names: [], records: [] });
+    const id = row.set_id ? String(row.set_id) : '';
+    const name = row.sets?.name ? String(row.sets.name) : '';
+    if (id && !bucket.ids.includes(id)) bucket.ids.push(id);
+    if (name && !bucket.names.includes(name)) bucket.names.push(name);
+    if (row.sets && !bucket.records.some((x) => x.id === id)) {
+      bucket.records.push({
+        id,
+        name,
+        examId: row.sets.exam_id ?? null,
+        subjectId: row.sets.subject_id ?? null,
+        year: row.sets.year ?? null,
+        setType: row.sets.set_type ?? null,
+        isPublished: Boolean(row.sets.is_published),
+        position: Number(row.position || 0),
+      });
+    }
+  }
+  return sets;
+}
+
+async function validateQuestionSetCompatibility(questionId, setId) {
+  const set = await assertExists('sets', 'id', setId, 'Set');
+  const { data: question, error: qError } = await supabaseAdmin
+    .from('questions')
+    .select('id,exam_id')
+    .eq('id', questionId)
+    .maybeSingle();
+  if (qError) throw qError;
+  if (!question) {
+    const err = new Error(`Question not found: ${questionId}`);
+    err.status = 404;
+    err.code = 'question_not_found';
+    throw err;
+  }
+
+  const { data: mappedExams, error: mapError } = await supabaseAdmin
+    .from('question_exams')
+    .select('exam_id')
+    .eq('question_id', questionId);
+  if (mapError) throw mapError;
+
+  const examIds = (mappedExams || []).map((r) => String(r.exam_id));
+  const compatible = examIds.length
+    ? examIds.includes(String(set.exam_id))
+    : (!question.exam_id || String(question.exam_id) === String(set.exam_id));
+
+  if (!compatible) {
+    const err = new Error(
+      `Question ${questionId} is not compatible with set ${setId}. The set exam must be one of the question's mapped exams.`
+    );
+    err.status = 400;
+    err.code = 'question_set_exam_mismatch';
+    throw err;
+  }
+  return set;
+}
+
+async function replaceQuestionSets(questionId, setIds = []) {
+  const desired = [...new Set((setIds || []).filter(Boolean).map(String))];
+  const { data: currentRows, error: currentError } = await supabaseAdmin
+    .from('set_questions')
+    .select('set_id,position')
+    .eq('question_id', questionId);
+  if (currentError) throw currentError;
+
+  const currentIds = (currentRows || []).map((r) => String(r.set_id));
+  for (const setId of desired) await validateQuestionSetCompatibility(questionId, setId);
+
+  const removed = currentIds.filter((id) => !desired.includes(id));
+  if (removed.length) {
+    const { error } = await supabaseAdmin
+      .from('set_questions')
+      .delete()
+      .eq('question_id', questionId)
+      .in('set_id', removed);
+    if (error) throw error;
+    for (const setId of removed) await refreshSetCount(setId);
+  }
+
+  const currentSet = new Set(currentIds);
+  for (const setId of desired) {
+    if (currentSet.has(setId)) continue;
+    const { data: last, error: lastError } = await supabaseAdmin
+      .from('set_questions')
+      .select('position')
+      .eq('set_id', setId)
+      .order('position', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (lastError) throw lastError;
+
+    const { error } = await supabaseAdmin
+      .from('set_questions')
+      .insert({
+        set_id: setId,
+        question_id: questionId,
+        position: Number(last?.position || 0) + 1,
+      });
+    if (error && error.code !== '23505') throw error;
+    await refreshSetCount(setId);
+  }
+}
+
+function mapQuestionAdminWithMappings(row, maps) {
+  const base = mapQuestionAdmin(row);
+
+  const e0 = maps.exams[row.id]    || { ids: [], names: [] };
+  const s0 = maps.subjects[row.id] || { ids: [], names: [] };
+  const t0 = maps.topics[row.id]   || { ids: [], names: [] };
+  const set0 = maps.sets?.[row.id] || { ids: [], names: [], records: [] };
+
+  // If a legacy question has not been backfilled yet, expose its old single
+  // value as a one-item array. Once mappings exist, only mapping-table values
+  // are used for the multi-value UI.
+  const examIds = e0.ids.length ? e0.ids : (base.examId ? [String(base.examId)] : []);
+  const examNames = e0.names.length ? e0.names : (base.examName ? [String(base.examName)] : []);
+  const subjectIds = s0.ids.length ? s0.ids : (base.subjectId ? [String(base.subjectId)] : []);
+  const subjectNames = s0.names;
+  const topicIds = t0.ids.length ? t0.ids : (base.topicId ? [String(base.topicId)] : []);
+  const topicNames = t0.names;
+
+  return {
+    ...base,
+    examIds: [...new Set(examIds)],
+    examNames: [...new Set(examNames)],
+    subjectIds: [...new Set(subjectIds)],
+    subjectNames: [...new Set(subjectNames)],
+    topicIds: [...new Set(topicIds)],
+    topicNames: [...new Set(topicNames)],
+    setIds: [...new Set(set0.ids)],
+    setNames: [...new Set(set0.names)],
+    sets: set0.records || [],
+
+    // Legacy DB/API compatibility only. Admin UI never renders these
+    // singular values as separate mapping fields.
+    examId: examIds[0] ?? null,
+    examName: examNames[0] ?? null,
+    subjectId: subjectIds[0] ?? null,
+    topicId: topicIds[0] ?? null,
+  };
+}
+
+async function replaceQuestionMappings(questionId, { examIds = [], subjectIds = [], topicIds = [] }) {
+  await supabaseAdmin.from("question_exams").delete().eq("question_id", questionId);
+  await supabaseAdmin.from("question_subjects").delete().eq("question_id", questionId);
+  await supabaseAdmin.from("question_topics").delete().eq("question_id", questionId);
+
+  const jobs = [];
+
+  if (examIds.length) {
+    jobs.push(
+      supabaseAdmin.from("question_exams").insert(
+        examIds.map((exam_id) => ({ question_id: questionId, exam_id }))
+      )
+    );
+  }
+  if (subjectIds.length) {
+    jobs.push(
+      supabaseAdmin.from("question_subjects").insert(
+        subjectIds.map((subject_id) => ({ question_id: questionId, subject_id }))
+      )
+    );
+  }
+  if (topicIds.length) {
+    jobs.push(
+      supabaseAdmin.from("question_topics").insert(
+        topicIds.map((topic_id) => ({ question_id: questionId, topic_id }))
+      )
+    );
+  }
+
+  const results = await Promise.all(jobs);
+  for (const r of results) if (r.error) throw r.error;
+}
+
+// Accept both plural (examIds) and singular (examId) from body
+function pickIds(body, pluralKey, singularKey) {
+  const plural = body?.[pluralKey];
+  if (Array.isArray(plural)) {
+    return [...new Set(plural.filter(Boolean).map(String))];
+  }
+  const single = body?.[singularKey];
+  if (single) return [String(single)];
+  return [];
+}
+
 function mapQuestionAdmin(row) {
   return {
     id: row.id,
@@ -2182,6 +2443,7 @@ function mapQuestionAdmin(row) {
     explanation: row.explanation,
     imageUrl: row.image_url,
     hasImage: Boolean(row.has_image),
+    isActive: Boolean(row.is_active),
     createdAt: row.created_at || null,
     updatedAt: row.updated_at || null,
   };
@@ -2276,95 +2538,122 @@ async function assertExists(table, column, value, label) {
   return data;
 }
 
-async function validateSubjectExamRelation(subjectId, examId) {
-  if (!subjectId || !examId) return;
-  const subject = await assertExists('subjects', 'id', subjectId, 'Subject');
-  if (subject.exam_id !== examId) {
-    const err = new Error('Subject does not belong to the selected exam.');
-    err.status = 400;
-    err.code = 'subject_exam_mismatch';
-    throw err;
-  }
-}
+// Multi-mapping validation for questions.
+// A question may belong to many exams, subjects and topics. Relations are
+// validated as sets instead of comparing one legacy exam_id/subject_id pair.
+async function validateQuestionMappingRelations(examIds = [], subjectIds = [], topicIds = []) {
+  const exams = [...new Set((examIds || []).filter(Boolean).map(String))];
+  const subjects = [...new Set((subjectIds || []).filter(Boolean).map(String))];
+  const topics = [...new Set((topicIds || []).filter(Boolean).map(String))];
 
-async function validateTopicRelations(topicId, examId, subjectId) {
-  if (!topicId) return;
-  const topic = await assertExists('taxonomy_nodes', 'id', topicId, 'Topic');
+  if (subjects.length) {
+    const { data, error } = await supabaseAdmin
+      .from('subjects')
+      .select('id,exam_id')
+      .in('id', subjects);
+    if (error) throw error;
 
-  if (examId && topic.exam_id && topic.exam_id !== examId) {
-    const err = new Error('Topic does not belong to the selected exam.');
-    err.status = 400;
-    err.code = 'topic_exam_mismatch';
-    throw err;
-  }
-
-  if (subjectId && topic.subject_id && topic.subject_id !== subjectId) {
-    const err = new Error('Topic does not belong to the selected subject.');
-    err.status = 400;
-    err.code = 'topic_subject_mismatch';
-    throw err;
-  }
-}
-
-async function validateQuestionPayloadRelations(payloads = []) {
-  const examIds = [...new Set(payloads.map((p) => p.exam_id).filter(Boolean))];
-  const subjectIds = [...new Set(payloads.map((p) => p.subject_id).filter(Boolean))];
-  const topicIds = [...new Set(payloads.map((p) => p.topic_id).filter(Boolean))];
-
-  const [subjectsResult, topicsResult] = await Promise.all([
-    subjectIds.length
-      ? supabaseAdmin.from('subjects').select('id,exam_id').in('id', subjectIds)
-      : Promise.resolve({ data: [], error: null }),
-    topicIds.length
-      ? supabaseAdmin.from('taxonomy_nodes').select('id,exam_id,subject_id').in('id', topicIds)
-      : Promise.resolve({ data: [], error: null }),
-  ]);
-
-  if (subjectsResult.error) throw subjectsResult.error;
-  if (topicsResult.error) throw topicsResult.error;
-
-  const subjects = new Map((subjectsResult.data || []).map((x) => [x.id, x]));
-  const topics = new Map((topicsResult.data || []).map((x) => [x.id, x]));
-
-  for (const payload of payloads) {
-    if (payload.subject_id) {
-      const subject = subjects.get(payload.subject_id);
+    const byId = new Map((data || []).map((row) => [String(row.id), row]));
+    for (const subjectId of subjects) {
+      const subject = byId.get(subjectId);
       if (!subject) {
-        const err = new Error(`Subject not found: ${payload.subject_id}`);
+        const err = new Error(`Subject not found: ${subjectId}`);
         err.status = 404;
         err.code = 'subjects_not_found';
         throw err;
       }
-      if (payload.exam_id && subject.exam_id !== payload.exam_id) {
-        const err = new Error('Subject does not belong to the selected exam.');
+
+      // If exams were selected, a subject with an owning exam must match at
+      // least one of them. A subject with no exam_id is treated as universal.
+      if (exams.length && subject.exam_id && !exams.includes(String(subject.exam_id))) {
+        const err = new Error(
+          `Subject "${subjectId}" belongs to exam "${subject.exam_id}", which is not among the selected exams.`
+        );
         err.status = 400;
         err.code = 'subject_exam_mismatch';
         throw err;
       }
     }
+  }
 
-    if (payload.topic_id) {
-      const topic = topics.get(payload.topic_id);
+  if (topics.length) {
+    const { data, error } = await supabaseAdmin
+      .from('taxonomy_nodes')
+      .select('id,exam_id,subject_id')
+      .in('id', topics);
+    if (error) throw error;
+
+    const byId = new Map((data || []).map((row) => [String(row.id), row]));
+    const selectedSubjects = new Set(subjects);
+    const selectedExams = new Set(exams);
+
+    for (const topicId of topics) {
+      const topic = byId.get(topicId);
       if (!topic) {
-        const err = new Error(`Topic not found: ${payload.topic_id}`);
+        const err = new Error(`Topic not found: ${topicId}`);
         err.status = 404;
         err.code = 'taxonomy_nodes_not_found';
         throw err;
       }
-      if (payload.exam_id && topic.exam_id && topic.exam_id !== payload.exam_id) {
-        const err = new Error('Topic does not belong to the selected exam.');
+
+      if (
+        selectedExams.size &&
+        topic.exam_id &&
+        !selectedExams.has(String(topic.exam_id))
+      ) {
+        const err = new Error(
+          `Topic "${topicId}" belongs to exam "${topic.exam_id}", which is not among the selected exams.`
+        );
         err.status = 400;
         err.code = 'topic_exam_mismatch';
         throw err;
       }
-      if (payload.subject_id && topic.subject_id && topic.subject_id !== payload.subject_id) {
-        const err = new Error('Topic does not belong to the selected subject.');
+
+      if (
+        selectedSubjects.size &&
+        topic.subject_id &&
+        !selectedSubjects.has(String(topic.subject_id))
+      ) {
+        const err = new Error(
+          `Topic "${topicId}" belongs to subject "${topic.subject_id}", which is not among the selected subjects.`
+        );
         err.status = 400;
         err.code = 'topic_subject_mismatch';
         throw err;
       }
     }
   }
+}
+
+// Keep the old single-value helpers for non-question resources.
+async function validateSubjectExamRelationMulti(subjectIds, examIds) {
+  return validateQuestionMappingRelations(examIds, subjectIds, []);
+}
+
+// Backward-compatible single-value validator used by Sets/Taxonomy routes.
+// Question routes use validateQuestionMappingRelations() directly so they can
+// validate multiple exams, subjects and topics at once.
+async function validateSubjectExamRelation(subjectId, examId) {
+  return validateQuestionMappingRelations(
+    examId ? [String(examId)] : [],
+    subjectId ? [String(subjectId)] : [],
+    []
+  );
+}
+
+async function validateTopicRelations(topicId, examId, subjectId) {
+  return validateQuestionMappingRelations(
+    examId ? [examId] : [],
+    subjectId ? [subjectId] : [],
+    topicId ? [topicId] : []
+  );
+}
+
+async function validateQuestionPayloadRelations(payloads = []) {
+  const examIds = [...new Set(payloads.flatMap((p) => pickIds(p, 'examIds', 'examId')) .filter(Boolean))];
+  const subjectIds = [...new Set(payloads.flatMap((p) => pickIds(p, 'subjectIds', 'subjectId')) .filter(Boolean))];
+  const topicIds = [...new Set(payloads.flatMap((p) => pickIds(p, 'topicIds', 'topicId')) .filter(Boolean))];
+  return validateQuestionMappingRelations(examIds, subjectIds, topicIds);
 }
 
 async function refreshExamCounts(examIds = []) {
@@ -2377,8 +2666,8 @@ async function refreshExamCounts(examIds = []) {
         .eq('exam_id', examId),
 
       supabaseAdmin
-        .from('questions')
-        .select('id', { count: 'exact', head: true })
+        .from('question_exams')
+        .select('question_id', { count: 'exact', head: true })
         .eq('exam_id', examId),
 
       supabaseAdmin
@@ -2411,8 +2700,8 @@ async function refreshSubjectCounts(subjectIds = []) {
 
   for (const subjectId of ids) {
     const { count, error: countError } = await supabaseAdmin
-      .from('questions')
-      .select('id', { count: 'exact', head: true })
+      .from('question_subjects')
+      .select('question_id', { count: 'exact', head: true })
       .eq('subject_id', subjectId);
 
     if (countError) throw countError;
@@ -2478,12 +2767,7 @@ async function generatedTextId(table, base, prefix = 'item') {
 function questionPayload(body = {}) {
   const questionId = bodyValue(body, 'questionId', 'question_id');
   const stem = bodyValue(body, 'stem');
-  const questionType = bodyValue(
-    body,
-    'questionType',
-    'question_type',
-    'MCQ'
-  );
+  const questionType = bodyValue(body, 'questionType', 'question_type', 'MCQ');
   const difficulty = bodyValue(body, 'difficulty', 'difficulty', 1);
   const sourceYear = bodyValue(body, 'sourceYear', 'source_year');
   const examName = bodyValue(body, 'examName', 'exam_name');
@@ -2491,27 +2775,27 @@ function questionPayload(body = {}) {
   const subjectId = bodyValue(body, 'subjectId', 'subject_id');
   const topicId = bodyValue(body, 'topicId', 'topic_id');
   const options = bodyValue(body, 'options', 'options', {});
-  const correctOption = bodyValue(
-    body,
-    'correctOption',
-    'correct_option',
-    null
-  );
+  const correctOption = bodyValue(body, 'correctOption', 'correct_option', null);
   const explanation = bodyValue(body, 'explanation');
   const imageUrl = bodyValue(body, 'imageUrl', 'image_url');
-  const hasImage = bodyValue(
-    body,
-    'hasImage',
-    'has_image',
-    Boolean(imageUrl)
-  );
+  const hasImage = bodyValue(body, 'hasImage', 'has_image', Boolean(imageUrl));
+
+  // is_active — default FALSE (inactive until reviewed)
+  const isActiveRaw = bodyValue(body, 'isActive', 'is_active', true);
+  const isActive =
+    isActiveRaw === true ||
+    isActiveRaw === 'true' ||
+    isActiveRaw === 1 ||
+    isActiveRaw === '1';
 
   const cleanStem = requiredText(stem, 'stem');
 
-  if (String(questionType).toUpperCase() === 'MCQ' &&
-      (correctOption === undefined ||
-       correctOption === null ||
-       String(correctOption).trim() === '')) {
+  if (
+    String(questionType).toUpperCase() === 'MCQ' &&
+    (correctOption === undefined ||
+      correctOption === null ||
+      String(correctOption).trim() === '')
+  ) {
     const err = new Error('correctOption is required for MCQ questions.');
     err.status = 400;
     err.code = 'missing_correct_option';
@@ -2523,11 +2807,12 @@ function questionPayload(body = {}) {
       options === null ||
       typeof options !== 'object' ||
       (Array.isArray(options) && options.length === 0) ||
-      (!Array.isArray(options) &&
-        Object.keys(options).length === 0);
+      (!Array.isArray(options) && Object.keys(options).length === 0);
 
     if (invalidOptions) {
-      const err = new Error('options must be a non-empty JSON object/array for MCQ questions.');
+      const err = new Error(
+        'options must be a non-empty JSON object/array for MCQ questions.'
+      );
       err.status = 400;
       err.code = 'invalid_options';
       throw err;
@@ -2549,6 +2834,7 @@ function questionPayload(body = {}) {
     explanation: optionalText(explanation),
     image_url: optionalText(imageUrl),
     has_image: parseBoolean(hasImage, Boolean(imageUrl)),
+    is_active: isActive, // default true
   };
 }
 
@@ -2624,8 +2910,28 @@ async function replaceSetQuestions(setId, questionIds = []) {
     throw err;
   }
 
+  const questionIdsForSetCheck = (questions || []).map((q) => q.id);
+  const { data: questionExamLinks, error: questionExamLinkError } = questionIdsForSetCheck.length
+    ? await supabaseAdmin
+        .from('question_exams')
+        .select('question_id,exam_id')
+        .in('question_id', questionIdsForSetCheck)
+    : { data: [], error: null };
+  if (questionExamLinkError) throw questionExamLinkError;
+
+  const examLinksByQuestion = new Map();
+  for (const link of questionExamLinks || []) {
+    const list = examLinksByQuestion.get(link.question_id) || [];
+    list.push(String(link.exam_id));
+    examLinksByQuestion.set(link.question_id, list);
+  }
+
   const mismatched = (questions || [])
-    .filter((q) => q.exam_id && q.exam_id !== set.exam_id)
+    .filter((q) => {
+      const mappedExams = examLinksByQuestion.get(q.id) || [];
+      if (mappedExams.length) return !mappedExams.includes(String(set.exam_id));
+      return Boolean(q.exam_id && q.exam_id !== set.exam_id);
+    })
     .map((q) => q.id);
 
   if (mismatched.length) {
@@ -3387,13 +3693,19 @@ app.get('/api/admin/sets/:id', adminAuth, async (req, res) => {
 
     if (questionError) throw questionError;
 
+    const questionRows = (rows || []).filter((row) => row.question);
+    const questionIds = questionRows.map((row) => row.question_id);
+    const questionMaps = await loadQuestionMappings(questionIds);
+
     return response(res, {
       set: mapSet(set),
-      questions: (rows || []).map((row) => ({
+      questions: questionRows.map((row) => ({
         setId: row.set_id,
         questionId: row.question_id,
         position: row.position,
-        question: row.question ? mapQuestionAdmin(row.question) : null,
+        question: row.question
+          ? mapQuestionAdminWithMappings(row.question, questionMaps)
+          : null,
       })),
     });
   } catch (e) {
@@ -3558,6 +3870,7 @@ app.delete('/api/admin/sets/:id', adminAuth, async (req, res) => {
 // ADMIN - QUESTIONS
 // =========================================================
 
+
 app.get('/api/admin/questions', adminAuth, async (req, res) => {
   try {
     let query = supabaseAdmin
@@ -3565,15 +3878,43 @@ app.get('/api/admin/questions', adminAuth, async (req, res) => {
       .select('*')
       .order('created_at', { ascending: false });
 
-    const examId = req.query.examId || req.query.exam_id;
-    const subjectId = req.query.subjectId || req.query.subject_id;
-    const topicId = req.query.topicId || req.query.topic_id;
-    const difficulty = req.query.difficulty;
+    const examId       = req.query.examId || req.query.exam_id;
+    const subjectId    = req.query.subjectId || req.query.subject_id;
+    const topicId      = req.query.topicId || req.query.topic_id;
+    const difficulty   = req.query.difficulty;
     const questionType = req.query.questionType || req.query.question_type;
 
-    if (examId) query = query.eq('exam_id', examId);
-    if (subjectId) query = query.eq('subject_id', subjectId);
-    if (topicId) query = query.eq('topic_id', topicId);
+    // Many-to-many filters: query mapping tables first
+    if (examId || subjectId || topicId) {
+      let qids = null;
+
+      if (examId) {
+        const { data, error } = await supabaseAdmin
+          .from('question_exams').select('question_id').eq('exam_id', examId);
+        if (error) throw error;
+        qids = (data || []).map(r => r.question_id);
+      }
+      if (subjectId) {
+        const { data, error } = await supabaseAdmin
+          .from('question_subjects').select('question_id').eq('subject_id', subjectId);
+        if (error) throw error;
+        const ids = (data || []).map(r => r.question_id);
+        qids = qids ? qids.filter(x => ids.includes(x)) : ids;
+      }
+      if (topicId) {
+        const { data, error } = await supabaseAdmin
+          .from('question_topics').select('question_id').eq('topic_id', topicId);
+        if (error) throw error;
+        const ids = (data || []).map(r => r.question_id);
+        qids = qids ? qids.filter(x => ids.includes(x)) : ids;
+      }
+
+      if (!qids || !qids.length) {
+        return response(res, { questions: [] });
+      }
+      query = query.in('id', qids);
+    }
+
     if (difficulty !== undefined) query = query.eq('difficulty', number(difficulty));
     if (questionType) query = query.eq('question_type', questionType);
 
@@ -3581,51 +3922,73 @@ app.get('/api/admin/questions', adminAuth, async (req, res) => {
       query = query.ilike('stem', `%${String(req.query.search)}%`);
     }
 
-    const limit = Math.min(
-      Math.max(number(req.query.limit, 50), 1),
-      200
-    );
+    const limit = Math.min(Math.max(number(req.query.limit, 50), 1), 200);
     query = query.limit(limit);
 
     const { data, error: dbError } = await query;
     if (dbError) throw dbError;
 
+    const ids = (data || []).map(r => r.id);
+    const maps = await loadQuestionMappings(ids);
+    maps.sets = await loadQuestionSets(ids);
+
     return response(res, {
-      questions: (data || []).map(mapQuestionAdmin),
+      questions: (data || []).map(r => mapQuestionAdminWithMappings(r, maps)),
     });
   } catch (e) {
     return adminFail(res, e, 'admin_questions_error', 500);
   }
 });
 
+
 app.get('/api/admin/questions/:id', adminAuth, async (req, res) => {
   try {
     const { data, error: dbError } = await supabaseAdmin
-      .from('questions')
-      .select('*')
-      .eq('id', req.params.id)
-      .maybeSingle();
+      .from('questions').select('*').eq('id', req.params.id).maybeSingle();
 
     if (dbError) throw dbError;
     if (!data) return error(res, 404, 'Question not found.', 'question_not_found');
 
-    return response(res, { question: mapQuestionAdmin(data) });
+    const maps = await loadQuestionMappings([data.id]);
+    maps.sets = await loadQuestionSets([data.id]);
+    return response(res, { question: mapQuestionAdminWithMappings(data, maps) });
   } catch (e) {
     return adminFail(res, e, 'admin_question_get_error', 500);
   }
 });
 
+
 app.post('/api/admin/questions', adminAuth, async (req, res) => {
   try {
-    const payload = questionPayload(req.body || {});
+    const body = req.body || {};
+    const payload = questionPayload(body);
+
+    const examIds    = pickIds(body, 'examIds',    'examId');
+    const subjectIds = pickIds(body, 'subjectIds', 'subjectId');
+    const topicIds   = pickIds(body, 'topicIds',   'topicId');
+    const setIds = [...new Set([...(Array.isArray(body.setIds) ? body.setIds : []), ...(body.sourceSetId ? [body.sourceSetId] : [])].filter(Boolean).map(String))];
+
+    // Legacy single-value columns
+    payload.exam_id    = examIds[0]    || null;
+    payload.subject_id = subjectIds[0] || null;
+    payload.topic_id   = topicIds[0]   || null;
 
     if (payload.exam_id) {
       const exam = await assertExists('exams', 'id', payload.exam_id, 'Exam');
-      if (!payload.exam_name) payload.exam_name = exam.name;
+      payload.exam_name = exam.name;
+    } else if (payload.exam_name === undefined) {
+      payload.exam_name = null;
     }
-    await validateSubjectExamRelation(payload.subject_id, payload.exam_id);
-    await validateTopicRelations(payload.topic_id, payload.exam_id, payload.subject_id);
 
+    // Validate all selected IDs exist
+    for (const id of examIds)    await assertExists('exams',          'id', id, 'Exam');
+    for (const id of subjectIds) await assertExists('subjects',       'id', id, 'Subject');
+    for (const id of topicIds)   await assertExists('taxonomy_nodes', 'id', id, 'Topic');
+
+    // Validate the complete many-to-many selection as sets.
+    await validateQuestionMappingRelations(examIds, subjectIds, topicIds);
+
+    // Insert question
     const { data, error: dbError } = await supabaseAdmin
       .from('questions')
       .insert(payload)
@@ -3636,16 +3999,26 @@ app.post('/api/admin/questions', adminAuth, async (req, res) => {
     if (dbError) throw dbError;
     requireUpdatedRow(data, 'Question');
 
+    // Write mapping tables
+    if (examIds.length || subjectIds.length || topicIds.length) {
+      try {
+        await replaceQuestionMappings(data.id, { examIds, subjectIds, topicIds });
+      } catch (mapErr) {
+        await supabaseAdmin.from('questions').delete().eq('id', data.id);
+        throw mapErr;
+      }
+    }
+
+    // Link selected sets. The set list is also returned on question edit/view.
+    if (setIds.length) {
+      await replaceQuestionSets(data.id, setIds);
+    }
+
+    // sourceSetId linking + counts refresh
     try {
       if (req.body?.sourceSetId) {
         const sourceSetId = String(req.body.sourceSetId);
-        const sourceSet = await assertExists('sets', 'id', sourceSetId, 'Set');
-        if (payload.exam_id && sourceSet.exam_id !== payload.exam_id) {
-          const err = new Error('Question exam does not match the source set exam.');
-          err.status = 400;
-          err.code = 'question_set_exam_mismatch';
-          throw err;
-        }
+        await assertExists('sets', 'id', sourceSetId, 'Set');
 
         const { data: last, error: lastError } = await supabaseAdmin
           .from('set_questions')
@@ -3658,36 +4031,44 @@ app.post('/api/admin/questions', adminAuth, async (req, res) => {
 
         const { error: linkError } = await supabaseAdmin
           .from('set_questions')
-          .upsert({
-            set_id: sourceSetId,
-            question_id: data.id,
-            position: Number(last?.position || 0) + 1,
-          }, { onConflict: 'set_id,question_id' });
+          .upsert(
+            {
+              set_id: sourceSetId,
+              question_id: data.id,
+              position: Number(last?.position || 0) + 1,
+            },
+            { onConflict: 'set_id,question_id' }
+          );
         if (linkError) throw linkError;
+
         await refreshSetCount(sourceSetId);
       }
 
-      await refreshSubjectCounts([payload.subject_id]);
-      await refreshExamCounts([payload.exam_id]);
+      await refreshSubjectCounts(subjectIds);
+      await refreshExamCounts(examIds);
     } catch (e) {
-      await supabaseAdmin
-        .from('set_questions')
-        .delete()
-        .eq('question_id', data.id);
-      await supabaseAdmin
-        .from('questions')
-        .delete()
-        .eq('id', data.id);
+      await supabaseAdmin.from('set_questions').delete().eq('question_id', data.id);
+      await supabaseAdmin.from('question_exams').delete().eq('question_id', data.id);
+      await supabaseAdmin.from('question_subjects').delete().eq('question_id', data.id);
+      await supabaseAdmin.from('question_topics').delete().eq('question_id', data.id);
+      await supabaseAdmin.from('questions').delete().eq('id', data.id);
       throw e;
     }
 
+    let maps = { exams: {}, subjects: {}, topics: {}, sets: {} };
+    try {
+      maps = await loadQuestionMappings([data.id]);
+      maps.sets = await loadQuestionSets([data.id]);
+    } catch (_) {}
+
     return response(res, {
-      question: mapQuestionAdmin(data),
+      question: mapQuestionAdminWithMappings(data, maps),
     }, 201);
   } catch (e) {
     return adminFail(res, e, 'admin_question_create_error');
   }
 });
+
 
 app.post('/api/admin/questions/bulk', adminAuth, async (req, res) => {
   try {
@@ -3703,14 +4084,50 @@ app.post('/api/admin/questions/bulk', adminAuth, async (req, res) => {
       return error(res, 400, 'Maximum 500 questions per request.', 'bulk_limit');
     }
 
+    // ---- Build payloads (is_active default handled by questionPayload) ----
     const payloads = items.map(questionPayload);
-    const examIds = [...new Set(payloads.map((x) => x.exam_id).filter(Boolean))];
-    const subjectIds = [...new Set(payloads.map((x) => x.subject_id).filter(Boolean))];
-    const topicIds = [...new Set(payloads.map((x) => x.topic_id).filter(Boolean))];
 
-    for (const examId of examIds) await assertExists('exams', 'id', examId, 'Exam');
-    await validateQuestionPayloadRelations(payloads);
+    // ---- Normalize legacy columns from the first selected mapping ----
+    // Mapping tables are the source of truth; legacy columns remain only for
+    // older API consumers and old queries.
+    for (let i = 0; i < items.length; i += 1) {
+      const item = items[i] || {};
+      const examIdsForItem = pickIds(item, 'examIds', 'examId');
+      const subjectIdsForItem = pickIds(item, 'subjectIds', 'subjectId');
+      const topicIdsForItem = pickIds(item, 'topicIds', 'topicId');
 
+      payloads[i].exam_id = examIdsForItem[0] || null;
+      payloads[i].subject_id = subjectIdsForItem[0] || null;
+      payloads[i].topic_id = topicIdsForItem[0] || null;
+
+      if (examIdsForItem.length) {
+        const exam = await assertExists('exams', 'id', examIdsForItem[0], 'Exam');
+        payloads[i].exam_name = exam.name;
+      }
+    }
+
+    // Validate every selected mapping, not only the first legacy value.
+    for (const item of items) {
+      for (const examId of pickIds(item, 'examIds', 'examId')) {
+        await assertExists('exams', 'id', examId, 'Exam');
+      }
+      for (const subjectId of pickIds(item, 'subjectIds', 'subjectId')) {
+        await assertExists('subjects', 'id', subjectId, 'Subject');
+      }
+      for (const topicId of pickIds(item, 'topicIds', 'topicId')) {
+        await assertExists('taxonomy_nodes', 'id', topicId, 'Topic');
+      }
+    }
+
+    for (const item of items) {
+      await validateQuestionMappingRelations(
+        pickIds(item, 'examIds', 'examId'),
+        pickIds(item, 'subjectIds', 'subjectId'),
+        pickIds(item, 'topicIds', 'topicId')
+      );
+    }
+
+    // ---- Insert questions ----
     const { data, error: dbError } = await supabaseAdmin
       .from('questions')
       .insert(payloads)
@@ -3725,32 +4142,122 @@ app.post('/api/admin/questions/bulk', adminAuth, async (req, res) => {
       throw err;
     }
 
+    // ---- Build questionId -> row map (order-safe, uses text question_id) ----
+    // Supabase usually returns same order as insert, but map by question_id to be safe.
+    const rowByQuestionId = new Map(
+      (data || []).map((row) => [String(row.question_id), row])
+    );
+
+    const resolveRow = (item, idx) => {
+      const qid = item?.questionId ?? item?.question_id;
+      if (qid && rowByQuestionId.has(String(qid))) {
+        return rowByQuestionId.get(String(qid));
+      }
+      return data[idx]; // fallback to positional
+    };
+
+    // ---- Write mapping tables ----
+    const mappingJobs = [];
+    items.forEach((item, idx) => {
+      const row = resolveRow(item, idx);
+      if (!row) return;
+
+      const mExamIds    = pickIds(item, 'examIds',    'examId');
+      const mSubjectIds = pickIds(item, 'subjectIds', 'subjectId');
+      const mTopicIds   = pickIds(item, 'topicIds',   'topicId');
+
+      // Sets are many-to-many too. They are written after the question's
+      // exam mappings exist so set/exam compatibility can be validated.
+
+      if (mExamIds.length) {
+        mappingJobs.push(
+          supabaseAdmin.from('question_exams').insert(
+            mExamIds.map((exam_id) => ({ question_id: row.id, exam_id }))
+          )
+        );
+      }
+      if (mSubjectIds.length) {
+        mappingJobs.push(
+          supabaseAdmin.from('question_subjects').insert(
+            mSubjectIds.map((subject_id) => ({ question_id: row.id, subject_id }))
+          )
+        );
+      }
+      if (mTopicIds.length) {
+        mappingJobs.push(
+          supabaseAdmin.from('question_topics').insert(
+            mTopicIds.map((topic_id) => ({ question_id: row.id, topic_id }))
+          )
+        );
+      }
+    });
+
+    if (mappingJobs.length) {
+      const mapResults = await Promise.all(mappingJobs);
+      const mapError = mapResults.find((r) => r && r.error);
+      if (mapError) throw mapError.error;
+    }
+
+    // ---- Write Set mappings too ----
+    // Accept both the new plural `setIds` and the importer's legacy
+    // `sourceSetId`. A question can belong to multiple sets.
     try {
-      await refreshSubjectCounts(subjectIds);
-      await refreshExamCounts(examIds);
+      for (let idx = 0; idx < items.length; idx += 1) {
+        const item = items[idx] || {};
+        const row = resolveRow(item, idx);
+        if (!row) continue;
+        const itemSetIds = pickIds(item, 'setIds', 'sourceSetId');
+        if (itemSetIds.length) {
+          await replaceQuestionSets(row.id, itemSetIds);
+        }
+      }
+    } catch (setMappingError) {
+      const insertedIds = data.map((row) => row.id).filter(Boolean);
+      if (insertedIds.length) {
+        await supabaseAdmin.from('set_questions').delete().in('question_id', insertedIds);
+      }
+      throw setMappingError;
+    }
+
+    // ---- Refresh counts (rollback questions + mappings on failure) ----
+    // Bulk requests can contain different mappings per question. Build the
+    // complete unique set of affected exam/subject ids instead of referring
+    // to variables from a single-question request.
+    const bulkExamIds = [...new Set(items.flatMap((item) => pickIds(item, 'examIds', 'examId')))];
+    const bulkSubjectIds = [...new Set(items.flatMap((item) => pickIds(item, 'subjectIds', 'subjectId')))];
+    try {
+      await refreshSubjectCounts(bulkSubjectIds);
+      await refreshExamCounts(bulkExamIds);
     } catch (e) {
       const insertedIds = data.map((row) => row.id).filter(Boolean);
       if (insertedIds.length) {
-        await supabaseAdmin
-          .from('set_questions')
-          .delete()
-          .in('question_id', insertedIds);
-        await supabaseAdmin
-          .from('questions')
-          .delete()
-          .in('id', insertedIds);
+        // rollback mappings first (FK safe), then questions
+        await supabaseAdmin.from('question_exams').delete().in('question_id', insertedIds);
+        await supabaseAdmin.from('question_subjects').delete().in('question_id', insertedIds);
+        await supabaseAdmin.from('question_topics').delete().in('question_id', insertedIds);
+        await supabaseAdmin.from('set_questions').delete().in('question_id', insertedIds);
+        await supabaseAdmin.from('questions').delete().in('id', insertedIds);
       }
       throw e;
     }
 
+    // ---- Load mappings once for all inserted rows ----
+    const insertedIds = data.map((row) => row.id).filter(Boolean);
+    let maps = { exams: {}, subjects: {}, topics: {}, sets: {} };
+    try {
+      maps = await loadQuestionMappings(insertedIds);
+      maps.sets = await loadQuestionSets(insertedIds);
+    } catch (_) {}
+
     return response(res, {
       count: data.length,
-      questions: data.map(mapQuestionAdmin),
+      questions: data.map((row) => mapQuestionAdminWithMappings(row, maps)),
     }, 201);
   } catch (e) {
     return adminFail(res, e, 'admin_questions_bulk_create_error');
   }
 });
+
 
 app.patch('/api/admin/questions/:id', adminAuth, async (req, res) => {
   try {
@@ -3766,6 +4273,26 @@ app.patch('/api/admin/questions/:id', adminAuth, async (req, res) => {
     const body = req.body || {};
     const update = {};
 
+    // ---- ADDITION A: read multi-select ids (safe, singular bhi accept) ----
+    const examIds    = pickIds(body, 'examIds',    'examId');
+    const subjectIds = pickIds(body, 'subjectIds', 'subjectId');
+    const topicIds   = pickIds(body, 'topicIds',   'topicId');
+    const setIds = body.setIds !== undefined ? [...new Set((Array.isArray(body.setIds) ? body.setIds : []).filter(Boolean).map(String))] : undefined;
+
+    const touchedMappings =
+      body.examIds !== undefined ||
+      body.exam_id !== undefined ||
+      body.examId !== undefined ||
+      body.subjectIds !== undefined ||
+      body.subject_id !== undefined ||
+      body.subjectId !== undefined ||
+      body.topicIds !== undefined ||
+      body.topic_id !== undefined ||
+      body.topicId !== undefined;
+
+    const touchedSets = setIds !== undefined || body.sourceSetId !== undefined;
+
+    // ---- Existing field updates (unchanged) ----
     if (body.questionId !== undefined || body.question_id !== undefined) {
       update.question_id = requiredText(
         bodyValue(body, 'questionId', 'question_id'),
@@ -3780,6 +4307,8 @@ app.patch('/api/admin/questions/:id', adminAuth, async (req, res) => {
     if (body.sourceYear !== undefined || body.source_year !== undefined) {
       update.source_year = nullableNumber(bodyValue(body, 'sourceYear', 'source_year'));
     }
+
+    // Exam legacy single-value sync
     if (body.examId !== undefined || body.exam_id !== undefined) {
       const examId = optionalText(bodyValue(body, 'examId', 'exam_id'));
       if (examId) {
@@ -3792,16 +4321,40 @@ app.patch('/api/admin/questions/:id', adminAuth, async (req, res) => {
     } else if (body.examName !== undefined || body.exam_name !== undefined) {
       update.exam_name = optionalText(bodyValue(body, 'examName', 'exam_name'));
     }
+
+    // Fallback: agar frontend ne examIds diya par examId nahi, to legacy exam_id ko first se sync karo
+    if (
+      touchedMappings &&
+      body.examId === undefined &&
+      body.exam_id === undefined
+    ) {
+      if (body.examIds !== undefined) {
+        update.exam_id = examIds[0] || null;
+        if (update.exam_id) {
+          const exam = await assertExists('exams', 'id', update.exam_id, 'Exam');
+          update.exam_name = exam.name;
+        } else {
+          update.exam_name = null;
+        }
+      }
+    }
+
     if (body.subjectId !== undefined || body.subject_id !== undefined) {
       const subjectId = optionalText(bodyValue(body, 'subjectId', 'subject_id'));
       if (subjectId) await assertExists('subjects', 'id', subjectId, 'Subject');
       update.subject_id = subjectId;
+    } else if (touchedMappings && body.subjectIds !== undefined) {
+      update.subject_id = subjectIds[0] || null;
     }
+
     if (body.topicId !== undefined || body.topic_id !== undefined) {
       const topicId = optionalText(bodyValue(body, 'topicId', 'topic_id'));
       if (topicId) await assertExists('taxonomy_nodes', 'id', topicId, 'Topic');
       update.topic_id = topicId;
+    } else if (touchedMappings && body.topicIds !== undefined) {
+      update.topic_id = topicIds[0] || null;
     }
+
     if (body.options !== undefined) update.options = body.options;
     if (body.correctOption !== undefined || body.correct_option !== undefined) {
       update.correct_option = optionalText(
@@ -3809,39 +4362,47 @@ app.patch('/api/admin/questions/:id', adminAuth, async (req, res) => {
       );
     }
     if (body.explanation !== undefined) update.explanation = optionalText(body.explanation);
+
     if (body.imageUrl !== undefined || body.image_url !== undefined) {
-      const imageUrl = optionalText(
-        bodyValue(body, 'imageUrl', 'image_url')
-      );
+      const imageUrl = optionalText(bodyValue(body, 'imageUrl', 'image_url'));
       update.image_url = imageUrl;
-      if (
-        body.hasImage === undefined &&
-        body.has_image === undefined
-      ) {
+      if (body.hasImage === undefined && body.has_image === undefined) {
         update.has_image = Boolean(imageUrl);
       }
     }
     if (body.hasImage !== undefined || body.has_image !== undefined) {
-      update.has_image = parseBoolean(
-        bodyValue(body, 'hasImage', 'has_image')
+      update.has_image = parseBoolean(bodyValue(body, 'hasImage', 'has_image'));
+    }
+
+    // ---- ADDITION B: is_active update ----
+    if (body.isActive !== undefined || body.is_active !== undefined) {
+      const val = body.isActive !== undefined ? body.isActive : body.is_active;
+      update.is_active = val === true || val === "true" || val === 1 || val === "1";
+    }
+
+    // Validate mappings whenever the request changes either the legacy or
+    // plural mapping fields. Never compare only one exam_id/subject_id pair.
+    if (touchedMappings) {
+      await validateQuestionMappingRelations(examIds, subjectIds, topicIds);
+    } else {
+      const effectiveExamId =
+        update.exam_id !== undefined ? update.exam_id : current.exam_id;
+      const effectiveSubjectId =
+        update.subject_id !== undefined ? update.subject_id : current.subject_id;
+      const effectiveTopicId =
+        update.topic_id !== undefined ? update.topic_id : current.topic_id;
+
+      await validateQuestionMappingRelations(
+        effectiveExamId ? [effectiveExamId] : [],
+        effectiveSubjectId ? [effectiveSubjectId] : [],
+        effectiveTopicId ? [effectiveTopicId] : []
       );
     }
 
-    const effectiveExamId =
-      update.exam_id !== undefined ? update.exam_id : current.exam_id;
-    const effectiveSubjectId =
-      update.subject_id !== undefined ? update.subject_id : current.subject_id;
-    const effectiveTopicId =
-      update.topic_id !== undefined ? update.topic_id : current.topic_id;
-
-    await validateSubjectExamRelation(effectiveSubjectId, effectiveExamId);
-    await validateTopicRelations(
-      effectiveTopicId,
-      effectiveExamId,
-      effectiveSubjectId
-    );
-
-    ensureNonEmptyUpdate(update);
+    // A question may be edited only to change its set memberships. In that
+    // case there is no columns update required on `questions` itself.
+    const hasQuestionColumnUpdate = Object.keys(update).length > 0;
+    if (hasQuestionColumnUpdate) ensureNonEmptyUpdate(update);
 
     const nextQuestionType = update.question_type || current.question_type;
     const nextCorrectOption =
@@ -3854,8 +4415,7 @@ app.patch('/api/admin/questions/:id', adminAuth, async (req, res) => {
       !nextCorrectOption
     ) {
       return error(
-        res,
-        400,
+        res, 400,
         'correctOption is required for MCQ questions.',
         'missing_correct_option'
       );
@@ -3869,40 +4429,81 @@ app.patch('/api/admin/questions/:id', adminAuth, async (req, res) => {
         nextOptions === null ||
         typeof nextOptions !== 'object' ||
         (Array.isArray(nextOptions) && nextOptions.length === 0) ||
-        (!Array.isArray(nextOptions) &&
-          Object.keys(nextOptions).length === 0);
+        (!Array.isArray(nextOptions) && Object.keys(nextOptions).length === 0);
 
       if (invalidOptions) {
         return error(
-          res,
-          400,
+          res, 400,
           'options must be a non-empty JSON object/array for MCQ questions.',
           'invalid_options'
         );
       }
     }
 
-    update.updated_at = now();
+    let data = current;
+    if (hasQuestionColumnUpdate) {
+      update.updated_at = now();
 
-    const { data, error: dbError } = await supabaseAdmin
-      .from('questions')
-      .update(update)
-      .eq('id', req.params.id)
-      .select('*')
-      .limit(1)
-      .maybeSingle();
+      // ---- DB update ----
+      const { data: updated, error: dbError } = await supabaseAdmin
+        .from('questions')
+        .update(update)
+        .eq('id', req.params.id)
+        .select('*')
+        .limit(1)
+        .maybeSingle();
 
-    if (dbError) throw dbError;
-    requireUpdatedRow(data, 'Question');
+      if (dbError) throw dbError;
+      requireUpdatedRow(updated, 'Question');
+      data = updated;
+    }
 
-    await refreshSubjectCounts([current.subject_id, data.subject_id]);
-    await refreshExamCounts([current.exam_id, data.exam_id]);
+    // ---- ADDITION C: replace mappings if touched ----
+    if (touchedMappings) {
+      try {
+        await replaceQuestionMappings(req.params.id, {
+          examIds,
+          subjectIds,
+          topicIds,
+        });
+      } catch (mapErr) {
+        // Best-effort rollback: restore legacy single-value fields from `current`
+        await supabaseAdmin
+          .from('questions')
+          .update({
+            exam_id: current.exam_id,
+            exam_name: current.exam_name,
+            subject_id: current.subject_id,
+            topic_id: current.topic_id,
+          })
+          .eq('id', req.params.id);
+        throw mapErr;
+      }
+    }
 
-    return response(res, { question: mapQuestionAdmin(data) });
+    if (touchedSets) {
+      const desiredSetIds = setIds !== undefined ? setIds : (body.sourceSetId ? [String(body.sourceSetId)] : []);
+      await replaceQuestionSets(req.params.id, desiredSetIds);
+    }
+
+    await refreshSubjectCounts([current.subject_id, data.subject_id, ...subjectIds]);
+    await refreshExamCounts([current.exam_id, data.exam_id, ...examIds]);
+
+    // ---- Return with mappings (safe fallback) ----
+    let maps = { exams: {}, subjects: {}, topics: {}, sets: {} };
+    try {
+      maps = await loadQuestionMappings([data.id]);
+      maps.sets = await loadQuestionSets([data.id]);
+    } catch (_) {}
+
+    return response(res, {
+      question: mapQuestionAdminWithMappings(data, maps),
+    });
   } catch (e) {
     return adminFail(res, e, 'admin_question_update_error');
   }
 });
+
 
 app.delete('/api/admin/questions/:id', adminAuth, async (req, res) => {
   try {
@@ -3915,6 +4516,16 @@ app.delete('/api/admin/questions/:id', adminAuth, async (req, res) => {
     if (currentError) throw currentError;
     if (!current) return error(res, 404, 'Question not found.', 'question_not_found');
 
+    const [oldExamMap, oldSubjectMap] = await Promise.all([
+      supabaseAdmin.from('question_exams').select('exam_id').eq('question_id', req.params.id),
+      supabaseAdmin.from('question_subjects').select('subject_id').eq('question_id', req.params.id),
+    ]);
+    if (oldExamMap.error) throw oldExamMap.error;
+    if (oldSubjectMap.error) throw oldSubjectMap.error;
+
+    const oldExamIds = (oldExamMap.data || []).map((x) => x.exam_id);
+    const oldSubjectIds = (oldSubjectMap.data || []).map((x) => x.subject_id);
+
     const { error: dbError } = await supabaseAdmin
       .from('questions')
       .delete()
@@ -3922,8 +4533,8 @@ app.delete('/api/admin/questions/:id', adminAuth, async (req, res) => {
 
     if (dbError) throw dbError;
 
-    await refreshSubjectCounts([current.subject_id]);
-    await refreshExamCounts([current.exam_id]);
+    await refreshSubjectCounts([current.subject_id, ...oldSubjectIds]);
+    await refreshExamCounts([current.exam_id, ...oldExamIds]);
 
     return response(res, { deleted: true, id: req.params.id });
   } catch (e) {
@@ -3952,12 +4563,18 @@ app.get('/api/admin/sets/:setId/questions', adminAuth, async (req, res) => {
 
     if (dbError) throw dbError;
 
+    const questionRows = (data || []).filter((row) => row.question);
+    const questionIds = questionRows.map((row) => row.question_id);
+    const questionMaps = await loadQuestionMappings(questionIds);
+
     return response(res, {
-      questions: (data || []).map((row) => ({
+      questions: questionRows.map((row) => ({
         setId: row.set_id,
         questionId: row.question_id,
         position: row.position,
-        question: row.question ? mapQuestionAdmin(row.question) : null,
+        question: row.question
+          ? mapQuestionAdminWithMappings(row.question, questionMaps)
+          : null,
       })),
     });
   } catch (e) {
@@ -3976,11 +4593,27 @@ app.post('/api/admin/sets/:setId/questions', adminAuth, async (req, res) => {
     );
 
     const question = await assertExists('questions', 'id', questionId, 'Question');
-    if (question.exam_id && question.exam_id !== set.exam_id) {
+
+    // A question can belong to multiple exams. The set is compatible when
+    // the set exam exists in the question_exams mapping. Legacy exam_id is
+    // only used as a fallback for questions not yet backfilled.
+    const { data: mappedExams, error: mappedExamError } = await supabaseAdmin
+      .from('question_exams')
+      .select('exam_id')
+      .eq('question_id', questionId);
+
+    if (mappedExamError) throw mappedExamError;
+
+    const questionExamIds = (mappedExams || []).map((row) => String(row.exam_id));
+    const examCompatible = questionExamIds.length
+      ? questionExamIds.includes(String(set.exam_id))
+      : (!question.exam_id || String(question.exam_id) === String(set.exam_id));
+
+    if (!examCompatible) {
       return error(
         res,
         400,
-        'Question does not belong to the set exam.',
+        'Question is not mapped to the exam of this set.',
         'question_exam_mismatch'
       );
     }
@@ -4072,15 +4705,34 @@ app.post('/api/admin/sets/:setId/questions/bulk', adminAuth, async (req, res) =>
       throw err;
     }
 
+    const { data: mappedExams, error: mappedExamError } = await supabaseAdmin
+      .from('question_exams')
+      .select('question_id,exam_id')
+      .in('question_id', questionIds);
+
+    if (mappedExamError) throw mappedExamError;
+
+    const examsByQuestion = new Map();
+    for (const row of mappedExams || []) {
+      const list = examsByQuestion.get(row.question_id) || [];
+      list.push(String(row.exam_id));
+      examsByQuestion.set(row.question_id, list);
+    }
+
     const mismatched = (questions || [])
-      .filter((q) => q.exam_id && q.exam_id !== set.exam_id)
+      .filter((q) => {
+        const mapped = examsByQuestion.get(q.id) || [];
+        return mapped.length
+          ? !mapped.includes(String(set.exam_id))
+          : Boolean(q.exam_id && String(q.exam_id) !== String(set.exam_id));
+      })
       .map((q) => q.id);
 
     if (mismatched.length) {
       return error(
         res,
         400,
-        `Question(s) belong to a different exam: ${mismatched.join(', ')}`,
+        `Question(s) are not mapped to this set's exam: ${mismatched.join(', ')}`,
         'question_exam_mismatch'
       );
     }
