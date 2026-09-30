@@ -3345,19 +3345,34 @@ app.get('/api/admin/subjects', adminAuth, async (req, res) => {
 app.post('/api/admin/subjects', adminAuth, async (req, res) => {
   try {
     const body = req.body || {};
-    const name = requiredText(bodyValue(body, 'name'), 'name');
-    const examId = requiredText(bodyValue(body, 'examId', 'exam_id'), 'examId');
 
-    await assertExists('exams', 'id', examId, 'Exam');
+    const name = requiredText(bodyValue(body, 'name'), 'name');
+
+    // Root subject ke liye examId optional hai
+    const rawExamId = bodyValue(body, 'examId', 'exam_id');
+    const examId = rawExamId ? optionalText(rawExamId) : null;
+
+    // Sirf examId diya gaya ho tabhi exam existence check karo
+    if (examId) {
+      await assertExists('exams', 'id', examId, 'Exam');
+    }
 
     const payload = {
-      id: await generatedTextId('subjects', `${examId}-${name}`, 'subject'),
+      id: await generatedTextId(
+        'subjects',
+        `${examId || 'root'}-${name}`,
+        'subject'
+      ),
       name,
       exam_id: examId,
       question_count: 0,
-      node_type: String(bodyValue(body, 'nodeType', 'node_type', 'SUBJECT')),
+      node_type: String(
+        bodyValue(body, 'nodeType', 'node_type', 'SUBJECT')
+      ),
       slug: optionalText(bodyValue(body, 'slug')),
-      display_order: number(bodyValue(body, 'displayOrder', 'display_order', 0)),
+      display_order: number(
+        bodyValue(body, 'displayOrder', 'display_order', 0)
+      ),
     };
 
     const { data, error: dbError } = await supabaseAdmin
@@ -3368,7 +3383,13 @@ app.post('/api/admin/subjects', adminAuth, async (req, res) => {
 
     if (dbError) throw dbError;
 
-    return response(res, { subject: mapSubject(data) }, 201);
+    return response(
+      res,
+      {
+        subject: mapSubject(data),
+      },
+      201
+    );
   } catch (e) {
     return adminFail(res, e, 'admin_subject_create_error');
   }
@@ -3389,11 +3410,16 @@ app.patch('/api/admin/subjects/:id', adminAuth, async (req, res) => {
       update.name = requiredText(name, 'name');
     }
 
-    if (body.examId !== undefined || body.exam_id !== undefined) {
-      const examId = requiredText(bodyValue(body, 'examId', 'exam_id'), 'examId');
-      await assertExists('exams', 'id', examId, 'Exam');
-      update.exam_id = examId;
-    }
+  if (body.examId !== undefined || body.exam_id !== undefined) {
+  const rawExamId = bodyValue(body, 'examId', 'exam_id');
+  const examId = rawExamId ? optionalText(rawExamId) : null;
+
+  if (examId) {
+    await assertExists('exams', 'id', examId, 'Exam');
+  }
+
+  update.exam_id = examId;
+}
 
     if (body.nodeType !== undefined || body.node_type !== undefined) {
       update.node_type = String(bodyValue(body, 'nodeType', 'node_type'));
